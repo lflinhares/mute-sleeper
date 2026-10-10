@@ -24,7 +24,8 @@ inside it, nested groups included.
   switch off together with their contents).
 - When the track is on again, only the devices Mute Sleeper switched off are
   switched back on. Devices you turned off yourself stay off.
-- The list of sleeping devices is saved with the Live set.
+- The list of sleeping devices is saved with the Live set (up to 32 devices
+  per instance, counted across the tracks it covers).
 
 Controls:
 

@@ -12,8 +12,10 @@
 //    it. Muting a track alone does NOT stop plugins from using CPU.
 //  - When the track is back ON, only the devices this script switched off
 //    are switched back on. Devices you turned off yourself stay off.
-//  - The list of sleeping devices is saved with the Live set (hidden blob
-//    parameter on the [js] box, via getvalueof/setvalueof).
+//  - The list of sleeping devices is saved with the Live set in four
+//    hidden [live.numbox] parameters ("Sleep Mask 1-4"), 8 bits each: bit n
+//    is set when the n-th device of the scope (all tracks' devices in
+//    order, first 32) was switched off by this script.
 //  - Switching this device off (Live's device on/off button, via
 //    [live.thisdevice]'s middle outlet) wakes everything it put to sleep.
 //
@@ -25,11 +27,14 @@
 //   enable <0/1>    - device on/off state, from live.thisdevice
 //   pluginsonly <0/1> - only sleep VST/AU plugins, leave Live devices alone
 //   wakeall         - recovery: switch ON every device on tracks that are ON
+//   mask <i> <v>    - saved Sleep Mask i (0-3), sent by its live.numbox when
+//                     the Live set loads
 //
 // Outlet 0: "set ..." status text for the comment box.
+// Outlets 1-4: int 0-255 -> the Sleep Mask live.numbox parameters.
 
 inlets = 1;
-outlets = 1;
+outlets = 5;
 
 autowatch = 1;
 
@@ -46,7 +51,21 @@ var hostId = 0;
 var scope = [];      // track ids: host first, then descendants in song order
 var parentOf = {};   // track id -> group track id (0 = none)
 var slept = {};      // device id -> true, devices this script switched off
-var pendingState = null; // saved state received before init
+
+var NUM_MASKS = 4;
+var MASK_BITS = 8;
+var pendingMask = null;          // saved masks received before init
+var lastMask = [-1, -1, -1, -1]; // last values written to the parameters
+// False while the Live set is still handing back its saved masks; nothing
+// is written to the parameters until then, so they are not overwritten.
+var settled = false;
+
+// Survives this script being reloaded (e.g. after editing the device in
+// Max) while Live stays open. Keyed by this device's Live object id, which
+// is stable for the whole session. The Sleep Mask parameters cover Live
+// restarts.
+// Stored as plain strings ("12,34"), which are safe across js instances.
+var store = new Global("mutesleeper_state");
 
 var observers = [];
 var lastTracks = "";
@@ -54,6 +73,12 @@ var lastDevices = {}; // track id -> joined device id list
 
 var applyTask = new Task(applyAll, this);
 var rebuildTask = new Task(rebuild, this);
+var settleTask = new Task(settle, this);
+
+// When this file is edited, autowatch reloads the script but live.thisdevice
+// does not bang again, so start up from here as well.
+var bootTask = new Task(init, this);
+bootTask.schedule(1000);
 
 // ---------------------------------------------------------------- helpers
 
@@ -143,8 +168,10 @@ function status() {
 // -------------------------------------------------------------- messages
 
 function init() {
+	if (initialized) return;
 	var me = new LiveAPI("this_device");
 	thisDeviceId = parseInt(me.id, 10);
+	if (!(thisDeviceId > 0)) return; // Live API not ready yet
 	thisDeviceName = first(me.get("name")) || "";
 
 	// Walk up from the device (it may be inside a rack) to its track.
@@ -157,8 +184,25 @@ function init() {
 		return;
 	}
 	hostId = parseInt(p.id, 10);
+
+	// Same device reloaded in this session: take its list back.
+	var kept = store["d" + thisDeviceId];
+	if (kept) {
+		var list = String(kept).split(",");
+		for (var k = 0; k < list.length; k++) {
+			var id = parseInt(list[k], 10);
+			if (id > 0 && deviceExists(id)) slept[id] = true;
+		}
+	}
+
 	initialized = true;
 	rebuild();
+	settleTask.schedule(1000);
+}
+
+function settle() {
+	settled = true;
+	applyAll();
 }
 
 function enable(v) {
@@ -238,9 +282,9 @@ function rebuild() {
 	}
 	observe(parseInt(song.id, 10), "tracks", onTracks);
 
-	if (pendingState !== null) {
-		adoptState(pendingState);
-		pendingState = null;
+	if (pendingMask !== null) {
+		for (var b = 0; b < NUM_MASKS; b++) adoptMask(b, pendingMask[b]);
+		pendingMask = null;
 	}
 	applyAll();
 }
@@ -295,49 +339,59 @@ function applyAll() {
 }
 
 // ------------------------------------------------------------ persistence
-// Saved as "trackIndex:deviceIndex,..." relative to the scope, because
-// Live object ids change every time the set is loaded.
+// Live object ids change every time the set is loaded, so the saved masks
+// refer to devices by position: slot n is the n-th device of the scope.
 
-function serialize() {
-	var parts = [];
+function slots() {
+	var out = [];
 	for (var i = 0; i < scope.length; i++) {
 		var devs = deviceIds(scope[i]);
-		for (var j = 0; j < devs.length; j++) {
-			if (slept[devs[j]]) parts.push(i + ":" + j);
-		}
+		for (var j = 0; j < devs.length; j++) out.push(devs[j]);
 	}
-	return parts.length ? parts.join(",") : "none";
+	return out.slice(0, NUM_MASKS * MASK_BITS);
 }
 
-function adoptState(str) {
-	if (!str || str === "none") return;
-	var parts = String(str).split(",");
-	for (var p = 0; p < parts.length; p++) {
-		var ij = parts[p].split(":");
-		var t = scope[parseInt(ij[0], 10)];
-		if (!t) continue;
-		var d = deviceIds(t)[parseInt(ij[1], 10)];
+function adoptMask(index, value) {
+	if (!value) return;
+	var s = slots();
+	for (var bit = 0; bit < MASK_BITS; bit++) {
+		if (!(value & (1 << bit))) continue;
+		var d = s[index * MASK_BITS + bit];
 		// Only adopt devices that are still off, so nothing gets woken by
 		// mistake if the set was rearranged.
 		if (d && managed(d) && !deviceIsOn(d)) slept[d] = true;
 	}
 }
 
-function saveState() {
-	notifyclients();
-}
-
-function getvalueof() {
-	if (!initialized) return pendingState !== null ? pendingState : "none";
-	return serialize();
-}
-
-function setvalueof(v) {
-	var str = arguments.length > 1 ? Array.prototype.join.call(arguments, " ") : String(v);
+function mask(index, value) {
+	index = parseInt(index, 10);
+	value = Math.round(value) & 255;
+	if (!(index >= 0 && index < NUM_MASKS)) return;
+	if (value === lastMask[index]) return; // echo of our own write
 	if (initialized) {
-		adoptState(str);
+		adoptMask(index, value);
 		applyTask.schedule(0);
 	} else {
-		pendingState = str;
+		if (pendingMask === null) pendingMask = [0, 0, 0, 0];
+		pendingMask[index] = value;
+	}
+}
+
+function saveState() {
+	var list = [];
+	for (var k in slept) list.push(k);
+	store["d" + thisDeviceId] = list.join(",");
+
+	if (!settled) return;
+	var s = slots();
+	for (var m = 0; m < NUM_MASKS; m++) {
+		var value = 0;
+		for (var bit = 0; bit < MASK_BITS; bit++) {
+			if (slept[s[m * MASK_BITS + bit]]) value |= (1 << bit);
+		}
+		if (value !== lastMask[m]) {
+			lastMask[m] = value;
+			outlet(1 + m, value);
+		}
 	}
 }
